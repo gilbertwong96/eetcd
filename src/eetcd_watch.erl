@@ -1,7 +1,7 @@
 -module(eetcd_watch).
 -include("eetcd.hrl").
 
--export_type([watch_conn/0]).
+-export_type([watch_conn/0, watch_cancel/0]).
 -type watch_conn() :: #{http2_pid => pid(),
                         monitor_ref => reference(),
                         stream_ref => gun:stream_ref(),
@@ -20,6 +20,11 @@
                                           compact_revision => integer()
                                          }}
                        }.
+
+-type watch_cancel() :: #{http_pid => pid(),
+                          cancel_reason => binary(),
+                          stream_ref => gun:stream_ref(),
+                          revision => neg_integer()}.
 
 %% API
 -export([new/0, with_key/2,
@@ -163,7 +168,7 @@ watch(Name, CreateReq, undefined, Timeout) ->
 %% Do watch request with a new watch stream.
 -spec watch_new_(context(), pid(), reference(), pos_integer()) ->
     {ok, watch_conn(), WatchId :: pos_integer()} |
-    {error, eetcd_error()}.
+    {error, watch_cancel() | eetcd_error()}.
 watch_new_(CreateReq, Gun, StreamRef, Timeout) ->
     Request = #{request_union => {create_request, CreateReq}},
     MRef = erlang:monitor(process, Gun),
@@ -172,26 +177,37 @@ watch_new_(CreateReq, Gun, StreamRef, Timeout) ->
         {response, nofin, 200, _Headers} ->
             case eetcd_stream:await(Gun, StreamRef, Timeout, MRef) of
                 {data, nofin, Body} ->
-                    {ok,
-                        #{
-                            created := true,
-                            canceled := false,
-                            compact_revision := CompactRev,
-                            header := #{revision := Rev},
-                            watch_id := WatchId
-                        }, <<>>}
+                    {ok, Response, <<>>}
                         = eetcd_grpc:decode(identity, Body, 'Etcd.WatchResponse'),
-                    {ok,
-                        #{
-                            http2_pid => Gun,
-                            monitor_ref => MRef,
-                            stream_ref => StreamRef,
-                            watch_ids => #{ WatchId => #{ revision => Rev,
-                                                          compact_revision => CompactRev}},
-                            unprocessed => <<>>
-                        },
-                        WatchId
-                    };
+                    case Response of
+                        #{created := true,
+                          canceled := false,
+                          compact_revision := CompactRev,
+                          header := #{revision := Rev},
+                          watch_id := WatchId} ->
+                            {ok,
+                             #{
+                               http2_pid => Gun,
+                               monitor_ref => MRef,
+                               stream_ref => StreamRef,
+                               watch_ids => #{WatchId => #{revision => Rev,
+                                                           compact_revision => CompactRev}},
+                               unprocessed => <<>>
+                              },
+                             WatchId
+                            };
+                        #{cancel_reason := Reason,
+                          canceled := true,
+                          compact_revision := 0,
+                          created := true,
+                          header := #{revision := Rev},
+                          watch_id := -1} ->
+                            erlang:demonitor(MRef, [flush]),
+                            {error, #{http_pid => Gun,
+                                      cancel_reason => Reason,
+                                      stream_ref => StreamRef,
+                                      revision => Rev}}
+                    end;
                 {error, _} = Err1 ->
                     erlang:demonitor(MRef, [flush]),
                     Err1
